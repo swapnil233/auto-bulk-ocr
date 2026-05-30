@@ -1,23 +1,87 @@
 import fs from "node:fs";
 import path from "node:path";
-import { Mistral } from "@mistralai/mistralai";
 import OpenAI from "openai";
+import { mdToPdf } from "md-to-pdf";
 import { encodeImage } from "./lib/encodeImage.js";
-import { getImageMimeType } from "./lib/mimeType.js";
 import { combineMarkdownFiles, stripMarkdownFences } from "./lib/markdownHelpers.js";
 
-const mistral = new Mistral({ apiKey: process.env.MISTRAL_API_KEY });
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL ?? "http://localhost:11434/v1";
+const OCR_MODEL = process.env.OCR_MODEL ?? "gemma4:e4b";
+const CONCURRENCY = readConcurrency();
 
-const OPENAI_MODEL = "gpt-5.2-2025-12-11";
+const client = new OpenAI({ baseURL: OLLAMA_BASE_URL, apiKey: "ollama" });
+
+const MIME_TYPES: Record<string, string> = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+};
+
+function readConcurrency(): number {
+    const raw = process.env.CONCURRENCY ?? "1";
+    const parsed = Number(raw);
+
+    if (!Number.isInteger(parsed) || parsed < 1) {
+        throw new Error(`CONCURRENCY must be a positive integer. Received: ${raw}`);
+    }
+
+    return parsed;
+}
+
+async function processFile(file: string, outDir: string): Promise<void> {
+    console.log(`\nProcessing ${path.basename(file)}...`);
+
+    const base64Image = encodeImage(file);
+    const mimeType = MIME_TYPES[path.extname(file).toLowerCase()] ?? "image/jpeg";
+    const imageUrl = `data:${mimeType};base64,${base64Image}`;
+
+    try {
+        const res = await client.chat.completions.create({
+            model: OCR_MODEL,
+            messages: [{
+                role: "user",
+                content: [
+                    {
+                        type: "text",
+                        text: [
+                            "Extract all text from this image and format it as clean Markdown.",
+                            "Rules:",
+                            "- Output ONLY markdown (no explanations, no ``` code fences)",
+                            "- Fix broken line wraps and hyphenation at line breaks",
+                            "- Preserve the original wording; only adjust formatting",
+                            "- Use headings, lists, and tables where clearly implied by the structure",
+                        ].join("\n"),
+                    },
+                    { type: "image_url", image_url: { url: imageUrl } },
+                ],
+            }],
+            temperature: 0,
+        });
+
+        const md = stripMarkdownFences(res.choices[0]?.message?.content ?? "");
+
+        if (!md.trim()) {
+            console.log(`Empty output for ${path.basename(file)}. Full response:`);
+            console.dir(res, { depth: null });
+            return;
+        }
+
+        const base = path.basename(file, path.extname(file));
+        const outPath = path.join(outDir, `${base}.md`);
+        fs.writeFileSync(outPath, md, "utf8");
+
+        console.log(`Done -> ${outPath}`);
+    } catch (error) {
+        console.log(`Error processing ${path.basename(file)}:`, error);
+    }
+}
 
 async function ocr(inputDir: string): Promise<string> {
-    // Resolve input directory and derive output directory
     const resolvedInputDir = path.resolve(inputDir);
     const dirName = path.basename(resolvedInputDir);
     const outDir = path.resolve("data", dirName);
 
-    // Validate input directory exists
     if (!fs.existsSync(resolvedInputDir)) {
         throw new Error(`Input directory does not exist: ${resolvedInputDir}`);
     }
@@ -31,86 +95,45 @@ async function ocr(inputDir: string): Promise<string> {
         throw new Error(`No image files found in: ${resolvedInputDir}`);
     }
 
-    // Create output directory
     fs.mkdirSync(outDir, { recursive: true });
 
     const listOfFiles = files.map((f) => path.join(resolvedInputDir, f));
-    console.log(`Processing ${listOfFiles.length} files from: ${resolvedInputDir}`);
+    console.log(`Processing ${listOfFiles.length} files from: ${resolvedInputDir} (concurrency: ${CONCURRENCY})`);
     console.log(`Output directory: ${outDir}`);
 
-    for (const file of listOfFiles) {
-        console.log(`\nStarting OCR for ${path.basename(file)}`);
-
-        const base64Image = encodeImage(file);
-        const mimeType = getImageMimeType(file);
-        const imageUrl = `data:${mimeType};base64,${base64Image}`;
-
-        try {
-            console.log("OCR first pass (Mistral)...");
-            const ocrRes = await mistral.ocr.process({
-                model: "mistral-ocr-2512",
-                document: {
-                    type: "image_url",
-                    imageUrl: imageUrl,
-                },
-            });
-
-            const raw = ocrRes.pages?.[0]?.markdown?.trim() ?? "";
-
-            if (!raw) {
-                console.log("Empty OCR output. Full OCR response:");
-                console.dir(ocrRes, { depth: null });
-                continue;
-            }
-
-            const cleanupPrompt = [
-                "You will be given OCR text. Convert it into clean, pure Markdown.",
-                "Rules:",
-                "- DO NOT include things like ``` or ```markdown",
-                "- Output ONLY markdown (no explanations).",
-                "- Fix broken line wraps and hyphenation at line breaks where appropriate.",
-                "- Preserve the original wording; only adjust formatting.",
-                "- Use headings, lists, and tables when clearly implied by the structure.",
-                "",
-                "OCR TEXT:",
-                raw,
-            ].join("\n");
-
-            console.log("Cleaning up OCR text (OpenAI)...");
-            const cleanupRes = await openai.chat.completions.create({
-                model: OPENAI_MODEL,
-                messages: [{ role: "user", content: cleanupPrompt }],
-                temperature: 0,
-            });
-
-            const md = stripMarkdownFences(
-                cleanupRes.choices?.[0]?.message?.content ?? ""
-            );
-
-            if (!md.trim()) {
-                console.log("Empty cleanup output. Full cleanup response:");
-                console.dir(cleanupRes, { depth: null });
-                continue;
-            }
-
-            const base = path.basename(file, path.extname(file));
-            const outPath = path.join(outDir, `${base}.md`);
-            fs.writeFileSync(outPath, md, "utf8");
-
-            console.log(`Done -> ${outPath}`);
-        } catch (error) {
-            console.log("Error during OCR pipeline:", error);
+    const queue = [...listOfFiles];
+    const workers = Array.from({ length: CONCURRENCY }, async () => {
+        while (queue.length > 0) {
+            const file = queue.shift()!;
+            await processFile(file, outDir);
         }
-    }
+    });
+    await Promise.all(workers);
 
     return outDir;
 }
 
 const dir = "src/files/deep_cover";
+const start = performance.now();
 
-ocr(dir).then((outDir) => {
-    combineMarkdownFiles(outDir, "combined.md");
-    console.log(`\nAll done! Combined output: ${path.join(outDir, "combined.md")}`);
+ocr(dir).then(async (outDir) => {
+    const combinedPath = combineMarkdownFiles(outDir, "combined.md");
+
+    if (!combinedPath) {
+        console.log("Skipping PDF generation because no markdown files were created.");
+        return;
+    }
+
+    console.log(`\nCombined markdown -> ${combinedPath}`);
+
+    console.log("Generating PDF...");
+    const pdfPath = path.join(outDir, "combined.pdf");
+    const pdf = await mdToPdf({ path: combinedPath });
+    fs.writeFileSync(pdfPath, pdf.content);
+    console.log(`PDF -> ${pdfPath}`);
+
+    const elapsed = ((performance.now() - start) / 1000).toFixed(1);
+    console.log(`\nAll done in ${elapsed}s`);
 }).catch((err) => {
     console.error(err);
     process.exitCode = 1;

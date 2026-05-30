@@ -8,7 +8,7 @@ export function stripMarkdownFences(input: string): string {
         .trim();
 }
 
-export function combineMarkdownFiles(outDir: string, combinedFileName: string): void {
+export function combineMarkdownFiles(outDir: string, combinedFileName: string): string | null {
     const mdFiles = fs
         .readdirSync(outDir)
         .filter((f) => f.endsWith(".md") && f !== combinedFileName)
@@ -16,7 +16,7 @@ export function combineMarkdownFiles(outDir: string, combinedFileName: string): 
 
     if (mdFiles.length === 0) {
         console.log("No markdown files to combine.");
-        return;
+        return null;
     }
 
     const combined = mdFiles
@@ -29,4 +29,5 @@ export function combineMarkdownFiles(outDir: string, combinedFileName: string): 
     const combinedPath = path.join(outDir, combinedFileName);
     fs.writeFileSync(combinedPath, combined, "utf8");
     console.log(`Combined ${mdFiles.length} files -> ${combinedPath}`);
+    return combinedPath;
 }
